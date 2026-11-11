@@ -57,3 +57,4 @@ jobs:
             apps/Android/MnnLlmChat/app/build/outputs/apk/debug/*.apk
             apps/Android/MnnLlmChat/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
+
