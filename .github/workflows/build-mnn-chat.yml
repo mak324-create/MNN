@@ -1,0 +1,180 @@
+name: Build MNN Chat APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, main ]
+    paths:
+      - '.github/workflows/build-mnn-chat.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-mnn-chat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Env info
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          command -v sdkmanager || true
+          ls -la "$ANDROID_HOME/cmdline-tools" 2>/dev/null || true
+          find "$ANDROID_HOME" /usr/local/lib/android -name sdkmanager -type f 2>/dev/null | head -n 10 || true
+          ls "$ANDROID_HOME/ndk" 2>/dev/null || true
+          ls "$ANDROID_HOME/cmake" 2>/dev/null || true
+          ls project/android 2>/dev/null || true
+          ls apps/Android/MnnLlmChat 2>/dev/null || true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Detect required NDK version
+        id: ndk
+        run: |
+          f=apps/Android/MnnLlmChat/app/build.gradle
+          v=$(grep -oP 'ndkVersion\s+"\K[^"]+' "$f" 2>/dev/null || true)
+          [ -z "$v" ] && v=$(grep -oP 'ndkVersion\s*=\s*"\K[^"]+' "$f" 2>/dev/null || true)
+          [ -z "$v" ] && v=$(grep -oP 'ndkVersion\s+rootProject\.ext\.\K[^\s"]+' "$f" 2>/dev/null || true)
+          echo "required=$v" >> "$GITHUB_OUTPUT"
+          echo "Detected NDK in build.gradle: '$v'"
+
+      - name: Locate sdkmanager
+        id: sdk
+        run: |
+          SM="$(command -v sdkmanager || true)"
+          if [ -z "$SM" ]; then
+            for p in \
+              "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+              "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+              "/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager"; do
+              [ -x "$p" ] && { SM="$p"; break; }
+            done
+          fi
+          if [ -z "$SM" ]; then
+            SM="$(find "$ANDROID_HOME" /usr/local/lib/android -name sdkmanager -type f 2>/dev/null | head -n1)"
+          fi
+          if [ -z "$SM" ]; then echo "sdkmanager not found"; exit 1; fi
+          echo "path=$SM" >> "$GITHUB_OUTPUT"
+          echo "Using sdkmanager: $SM"
+          "$SM" --version || true
+
+      - name: Install NDK + CMake
+        run: |
+          set -e
+          SM="${{ steps.sdk.outputs.path }}"
+          REQ="${{ steps.ndk.outputs.required }}"
+          yes | "$SM" --licenses >/dev/null 2>&1 || true
+
+          if [ -n "$REQ" ]; then
+            echo "Installing NDK $REQ ..."
+            if "$SM" --install "ndk;$REQ" ; then
+              echo "NDK $REQ installed"
+            else
+              echo "WARN: failed to install NDK $REQ, will fall back to preinstalled"
+            fi
+          fi
+
+          "$SM" --install "cmake;3.22.1" || echo "WARN: cmake 3.22.1 install failed"
+
+          ls "$ANDROID_HOME/ndk" 2>/dev/null || true
+          ls "$ANDROID_HOME/cmake" 2>/dev/null || true
+
+          if [ -n "$REQ" ] && [ -d "$ANDROID_HOME/ndk/$REQ" ]; then
+            CHOSEN="$ANDROID_HOME/ndk/$REQ"
+          else
+            CHOSEN="$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -n1)"
+          fi
+          if [ -z "$CHOSEN" ] || [ ! -d "$CHOSEN" ]; then
+            echo "ERROR: no NDK available on runner"; exit 1
+          fi
+          echo "ANDROID_NDK_HOME=$CHOSEN" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$CHOSEN" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$CHOSEN"      >> "$GITHUB_ENV"
+          echo "Selected NDK: $CHOSEN"
+
+      - name: Build MNN native libs (arm64)
+        working-directory: project/android
+        run: |
+          set -e
+          chmod +x build_64.sh
+          # ВАЖНО: build_64.sh сам делает mkdir -p build_64 && cd build_64,
+          # поэтому НЕ заходим в build_64 вручную — иначе создаётся вложенный build_64/build_64
+          ./build_64.sh "-DMNN_LOW_MEMORY=true \
+            -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true \
+            -DMNN_BUILD_LLM=true \
+            -DMNN_SUPPORT_TRANSFORMER_FUSE=true \
+            -DMNN_ARM82=true \
+            -DMNN_OPENCL=false"
+
+      - name: Verify libMNN.so location and normalize
+        working-directory: project/android
+        run: |
+          set -e
+          EXPECTED="build_64/lib/libMNN.so"
+          echo "Expecting: $EXPECTED"
+          if [ ! -f "$EXPECTED" ]; then
+            echo "Not found at expected path, searching build tree..."
+            FOUND="$(find build_64 -name 'libMNN.so' -type f 2>/dev/null | head -n1 || true)"
+            if [ -z "$FOUND" ]; then
+              echo "ERROR: libMNN.so not found anywhere under project/android/build_64"
+              find build_64 -maxdepth 3 -type d 2>/dev/null || true
+              exit 1
+            fi
+            echo "Found at: $FOUND — creating expected path layout"
+            mkdir -p build_64/lib
+            # копируем ВСЕ .so из найденной директории, чтобы покрыть libMNN_Express.so, libMNN_CL.so и т.п.
+            SRC_DIR="$(dirname "$FOUND")"
+            cp -v "$SRC_DIR"/*.so build_64/lib/ 2>/dev/null || true
+          fi
+          echo "--- libs in build_64/lib ---"
+          ls -la build_64/lib/ || true
+          if [ ! -f "build_64/lib/libMNN.so" ]; then
+            echo "ERROR: still missing build_64/lib/libMNN.so"; exit 1
+          fi
+
+      - name: Install MNN to /usr/local (for subprojects that look there)
+        working-directory: project/android/build_64
+        run: |
+          set -e
+          sudo make install
+          echo "--- /usr/local/lib (mnn) ---"
+          ls -la /usr/local/lib | grep -i mnn || true
+          echo "--- /usr/local/include (head) ---"
+          ls /usr/local/include | head || true
+
+      - name: Copy MNN .so into jniLibs
+        run: |
+          set -e
+          mkdir -p apps/Android/MnnLlmChat/app/src/main/jniLibs/arm64-v8a
+          find project/android/build_64 -name "*.so" -exec cp -v {} apps/Android/MnnLlmChat/app/src/main/jniLibs/arm64-v8a/ \;
+          echo "--- jniLibs ---"
+          ls -la apps/Android/MnnLlmChat/app/src/main/jniLibs/arm64-v8a/ || true
+
+      - name: Build APK
+        working-directory: apps/Android/MnnLlmChat
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mnn-chat-debug-apk
+          path: |
+            apps/Android/MnnLlmChat/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
