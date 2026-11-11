@@ -82,7 +82,6 @@ jobs:
           REQ="${{ steps.ndk.outputs.required }}"
           yes | "$SM" --licenses >/dev/null 2>&1 || true
 
-          # NDK: сначала пробуем требуемую версию, потом fallback на предустановленную
           if [ -n "$REQ" ]; then
             echo "Installing NDK $REQ ..."
             if "$SM" --install "ndk;$REQ" ; then
@@ -92,7 +91,6 @@ jobs:
             fi
           fi
 
-          # CMake
           "$SM" --install "cmake;3.22.1" || echo "WARN: cmake 3.22.1 install failed"
 
           echo "--- installed NDKs ---"
@@ -100,7 +98,6 @@ jobs:
           echo "--- installed cmakes ---"
           ls "$ANDROID_HOME/cmake" 2>/dev/null || true
 
-          # экспортируем выбранный NDK в GITHUB_ENV
           if [ -n "$REQ" ] && [ -d "$ANDROID_HOME/ndk/$REQ" ]; then
             CHOSEN="$ANDROID_HOME/ndk/$REQ"
           else
@@ -126,8 +123,12 @@ jobs:
             -DMNN_BUILD_LLM=true \
             -DMNN_SUPPORT_TRANSFORMER_FUSE=true \
             -DMNN_ARM82=true \
-            -DMNN_OPENCL=true"
-          make -j"$(nproc)" install
+            -DMNN_OPENCL=false"
+          make -j"$(nproc)"
+          sudo make install
+          echo "--- installed libs ---"
+          ls -la /usr/local/lib | grep -i mnn || true
+          ls -la /usr/local/include | head || true
 
       - name: Copy MNN .so into jniLibs
         run: |
