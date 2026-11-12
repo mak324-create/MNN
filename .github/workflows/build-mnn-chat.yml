@@ -80,40 +80,43 @@ jobs:
           echo "ANDROID_NDK=$CHOSEN"      >> "$GITHUB_ENV"
           echo "Selected NDK: $CHOSEN"
 
-      - name: Patch MNN 3.6.2 (OBJECT library PRE_BUILD bug)
-        run: |
-          set -e
-          FILE="transformers/llm/engine/CMakeLists.txt"
-          echo "=== Before patch (lines 85-105) ==="
-          sed -n '85,105p' "$FILE" || true
-
-          python3 - "$FILE" <<'PYEOF'
-          import re, sys
-          p = sys.argv[1]
-          s = open(p).read()
-          # add_custom_command(TARGET llm PRE_BUILD ...) не разрешён для OBJECT-библиотек.
-          # Меняем PRE_BUILD -> POST_BUILD в контексте TARGET llm.
-          s2 = re.sub(r'(TARGET\s+llm\b[^\n]*\n\s*)PRE_BUILD', r'\1POST_BUILD', s)
-          s2 = re.sub(r'(TARGET\s+llm\s+)PRE_BUILD', r'\1POST_BUILD', s2)
-          if s2 == s:
-              print("WARN: no PRE_BUILD after TARGET llm found; file unchanged")
-          else:
-              open(p, 'w').write(s2)
-              print("Patched:", p)
-          PYEOF
-
-          echo "=== After patch (lines 85-105) ==="
-          sed -n '85,105p' "$FILE" || true
-          echo "=== Sanity: any remaining PRE_BUILD near llm? ==="
-          grep -n -B2 -A2 'PRE_BUILD' "$FILE" || echo "(none)"
-
-      - name: Build MNN native libs
+      - name: Build MNN native libs (with inline patch)
         working-directory: project/android
         run: |
           set -e
           export PATH="$ANDROID_HOME/cmake/3.22.1/bin:$PATH"
           echo "Which cmake: $(command -v cmake)"
           cmake --version
+
+          # ===== PATCH: MNN 3.6.2 — OBJECT library + PRE_BUILD = error =====
+          FILE="../transformers/llm/engine/CMakeLists.txt"
+          echo "=== BEFORE (lines 85-105) ==="
+          sed -n '85,105p' "$FILE" || true
+          echo "=== PRE_BUILD occurrences ==="
+          grep -n 'PRE_BUILD' "$FILE" || echo "(none)"
+
+          # Меняем все PRE_BUILD -> POST_BUILD (в этом файле они только для llm)
+          sed -i 's/\bPRE_BUILD\b/POST_BUILD/g' "$FILE"
+
+          # Если после замены всё равно PRE_BUILD остался — вырезаем блок add_custom_command(TARGET llm ...)
+          if grep -q 'PRE_BUILD' "$FILE"; then
+            echo "WARN: PRE_BUILD still present, removing llm add_custom_command block"
+            python3 - "$FILE" <<'PYEOF'
+          import re, sys
+          p = sys.argv[1]
+          s = open(p).read()
+          # удалить add_custom_command(...) полностью, если внутри есть TARGET llm и PRE_BUILD/POST_BUILD
+          s = re.sub(r'add_custom_command\s*\((?:[^()]|\([^()]*\))*?TARGET\s+llm\b(?:[^()]|\([^()]*\))*?\)',
+                     '# [patched] add_custom_command(TARGET llm) removed\n', s, flags=re.S)
+          open(p, 'w').write(s)
+          PYEOF
+          fi
+
+          echo "=== AFTER (lines 85-105) ==="
+          sed -n '85,105p' "$FILE" || true
+          echo "=== remaining PRE_BUILD ==="
+          grep -n 'PRE_BUILD' "$FILE" || echo "(none)"
+          # ===== END PATCH =====
 
           rm -rf build_64
           mkdir -p build_64
