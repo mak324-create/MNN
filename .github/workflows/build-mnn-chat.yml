@@ -28,7 +28,6 @@ jobs:
       - name: Env info
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
           command -v sdkmanager || true
           ls "$ANDROID_HOME/ndk" 2>/dev/null || true
           ls "$ANDROID_HOME/cmake" 2>/dev/null || true
@@ -60,16 +59,14 @@ jobs:
           echo "path=$SM" >> "$GITHUB_OUTPUT"
           echo "Using: $SM"
 
-      - name: Install NDK + CMake 3.18.1
+      - name: Install NDK + CMake 3.22.1
         run: |
           set -e
           SM="${{ steps.sdk.outputs.path }}"
           REQ="${{ steps.ndk.outputs.required }}"
           yes | "$SM" --licenses >/dev/null 2>&1 || true
           [ -n "$REQ" ] && { "$SM" --install "ndk;$REQ" || echo "WARN: NDK $REQ install failed"; }
-          # CMake 3.18.1: PRE_BUILD на OBJECT library — ещё warning, не error.
-          # 3.20+ делает это ошибкой, и MNN 3.6.2 собираться перестаёт.
-          "$SM" --install "cmake;3.18.1" || echo "WARN: cmake 3.18.1 install failed"
+          "$SM" --install "cmake;3.22.1" || echo "WARN: cmake install failed"
           ls "$ANDROID_HOME/ndk" 2>/dev/null || true
           ls "$ANDROID_HOME/cmake" 2>/dev/null || true
           if [ -n "$REQ" ] && [ -d "$ANDROID_HOME/ndk/$REQ" ]; then
@@ -83,18 +80,38 @@ jobs:
           echo "ANDROID_NDK=$CHOSEN"      >> "$GITHUB_ENV"
           echo "Selected NDK: $CHOSEN"
 
-          CMAKE_BIN="$ANDROID_HOME/cmake/3.18.1/bin/cmake"
-          if [ ! -x "$CMAKE_BIN" ]; then echo "ERROR: cmake 3.18.1 not found at $CMAKE_BIN"; exit 1; fi
-          echo "SDK CMake 3.18.1: $CMAKE_BIN"
-          "$CMAKE_BIN" --version
+      - name: Patch MNN 3.6.2 (OBJECT library PRE_BUILD bug)
+        run: |
+          set -e
+          FILE="transformers/llm/engine/CMakeLists.txt"
+          echo "=== Before patch (lines 85-105) ==="
+          sed -n '85,105p' "$FILE" || true
 
-      - name: Build MNN native libs (CMake 3.18.1)
+          python3 - "$FILE" <<'PYEOF'
+          import re, sys
+          p = sys.argv[1]
+          s = open(p).read()
+          # add_custom_command(TARGET llm PRE_BUILD ...) не разрешён для OBJECT-библиотек.
+          # Меняем PRE_BUILD -> POST_BUILD в контексте TARGET llm.
+          s2 = re.sub(r'(TARGET\s+llm\b[^\n]*\n\s*)PRE_BUILD', r'\1POST_BUILD', s)
+          s2 = re.sub(r'(TARGET\s+llm\s+)PRE_BUILD', r'\1POST_BUILD', s2)
+          if s2 == s:
+              print("WARN: no PRE_BUILD after TARGET llm found; file unchanged")
+          else:
+              open(p, 'w').write(s2)
+              print("Patched:", p)
+          PYEOF
+
+          echo "=== After patch (lines 85-105) ==="
+          sed -n '85,105p' "$FILE" || true
+          echo "=== Sanity: any remaining PRE_BUILD near llm? ==="
+          grep -n -B2 -A2 'PRE_BUILD' "$FILE" || echo "(none)"
+
+      - name: Build MNN native libs
         working-directory: project/android
         run: |
           set -e
-          # Форсим CMake 3.18.1 — на 3.20+ add_custom_command(TARGET <OBJECT> PRE_BUILD)
-          # это ошибка, и MNN 3.6.2 не собирается.
-          export PATH="$ANDROID_HOME/cmake/3.18.1/bin:$PATH"
+          export PATH="$ANDROID_HOME/cmake/3.22.1/bin:$PATH"
           echo "Which cmake: $(command -v cmake)"
           cmake --version
 
