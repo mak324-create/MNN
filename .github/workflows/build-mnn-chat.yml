@@ -80,46 +80,13 @@ jobs:
           echo "ANDROID_NDK=$CHOSEN"      >> "$GITHUB_ENV"
           echo "Selected NDK: $CHOSEN"
 
-      - name: Build MNN native libs (with inline patch)
+      - name: Build MNN native libs
         working-directory: project/android
         run: |
           set -e
           export PATH="$ANDROID_HOME/cmake/3.22.1/bin:$PATH"
           echo "Which cmake: $(command -v cmake)"
           cmake --version
-
-          # ===== PATCH: MNN 3.6.2 — OBJECT library + PRE_BUILD = error =====
-          FILE="$GITHUB_WORKSPACE/transformers/llm/engine/CMakeLists.txt"
-          if [ ! -f "$FILE" ]; then
-            echo "ERROR: $FILE not found"
-            ls "$GITHUB_WORKSPACE/transformers" || true
-            exit 1
-          fi
-          echo "Patch target: $FILE"
-          echo "=== BEFORE (lines 85-105) ==="
-          sed -n '85,105p' "$FILE" || true
-          echo "=== PRE_BUILD occurrences ==="
-          grep -n 'PRE_BUILD' "$FILE" || echo "(none)"
-
-          sed -i 's/\bPRE_BUILD\b/POST_BUILD/g' "$FILE"
-
-          if grep -q 'PRE_BUILD' "$FILE"; then
-            echo "WARN: PRE_BUILD still present, removing llm add_custom_command block"
-            python3 - "$FILE" <<'PYEOF'
-          import re, sys
-          p = sys.argv[1]
-          s = open(p).read()
-          s = re.sub(r'add_custom_command\s*\((?:[^()]|\([^()]*\))*?TARGET\s+llm\b(?:[^()]|\([^()]*\))*?\)',
-                     '# [patched] add_custom_command(TARGET llm) removed\n', s, flags=re.S)
-          open(p, 'w').write(s)
-          PYEOF
-          fi
-
-          echo "=== AFTER (lines 85-105) ==="
-          sed -n '85,105p' "$FILE" || true
-          echo "=== remaining PRE_BUILD ==="
-          grep -n 'PRE_BUILD' "$FILE" || echo "(none)"
-          # ===== END PATCH =====
 
           rm -rf build_64
           mkdir -p build_64
@@ -130,6 +97,7 @@ jobs:
             -DANDROID_PLATFORM=android-21 \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$(pwd)/install" \
+            -DMNN_BUILD_FOR_ANDROID_COMMAND=true \
             -DMNN_LOW_MEMORY=true \
             -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true \
             -DMNN_BUILD_LLM=true \
