@@ -89,23 +89,26 @@ jobs:
           cmake --version
 
           # ===== PATCH: MNN 3.6.2 — OBJECT library + PRE_BUILD = error =====
-          FILE="../transformers/llm/engine/CMakeLists.txt"
+          FILE="$GITHUB_WORKSPACE/transformers/llm/engine/CMakeLists.txt"
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: $FILE not found"
+            ls "$GITHUB_WORKSPACE/transformers" || true
+            exit 1
+          fi
+          echo "Patch target: $FILE"
           echo "=== BEFORE (lines 85-105) ==="
           sed -n '85,105p' "$FILE" || true
           echo "=== PRE_BUILD occurrences ==="
           grep -n 'PRE_BUILD' "$FILE" || echo "(none)"
 
-          # Меняем все PRE_BUILD -> POST_BUILD (в этом файле они только для llm)
           sed -i 's/\bPRE_BUILD\b/POST_BUILD/g' "$FILE"
 
-          # Если после замены всё равно PRE_BUILD остался — вырезаем блок add_custom_command(TARGET llm ...)
           if grep -q 'PRE_BUILD' "$FILE"; then
             echo "WARN: PRE_BUILD still present, removing llm add_custom_command block"
             python3 - "$FILE" <<'PYEOF'
           import re, sys
           p = sys.argv[1]
           s = open(p).read()
-          # удалить add_custom_command(...) полностью, если внутри есть TARGET llm и PRE_BUILD/POST_BUILD
           s = re.sub(r'add_custom_command\s*\((?:[^()]|\([^()]*\))*?TARGET\s+llm\b(?:[^()]|\([^()]*\))*?\)',
                      '# [patched] add_custom_command(TARGET llm) removed\n', s, flags=re.S)
           open(p, 'w').write(s)
