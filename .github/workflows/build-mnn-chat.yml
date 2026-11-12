@@ -25,14 +25,31 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Env info
+      - name: Env info — diffusion flags and mnnllmapp CMake
         run: |
+          echo "===== Root CMakeLists: DIFFUSION flags ====="
+          grep -nE 'DIFFUSION|DIFFUSION_|MNN_BUILD_DIFFUSION' CMakeLists.txt || echo "(none)"
+          echo "===== diffusion/CMakeLists.txt (if exists) ====="
+          if [ -f diffusion/CMakeLists.txt ]; then
+            grep -nE 'add_library|install|MNN_BUILD|target_link|OUTPUT' diffusion/CMakeLists.txt || true
+          else
+            echo "(no diffusion/CMakeLists.txt)"
+          fi
+          echo "===== ALL .so/.a named *iffusion* / *ana* in tree ====="
+          find . -path ./project -prune -o \( -name '*Diffusion*' -o -name '*iffusion*' -o -name '*ana*ession*' \) -print 2>/dev/null | head -n 40 || true
+          echo "===== mnnllmapp CMakeLists: target_link_libraries block ====="
+          CPP="apps/Android/MnnLlmChat/app/src/main/cpp"
+          if [ -f "$CPP/CMakeLists.txt" ]; then
+            grep -nE 'target_link_libraries|MNN|MNN_Express|MNN_Diffusion|mnn_tts' "$CPP/CMakeLists.txt" || true
+            echo "--- full file head ---"
+            head -n 120 "$CPP/CMakeLists.txt" || true
+          fi
+          echo "===== cpp sources ====="
+          ls -la "$CPP" 2>/dev/null || true
+          echo "===== Android SDK / NDK / CMake ====="
           echo "ANDROID_HOME=$ANDROID_HOME"
-          command -v sdkmanager || true
           ls "$ANDROID_HOME/ndk" 2>/dev/null || true
           ls "$ANDROID_HOME/cmake" 2>/dev/null || true
-          ls project/android 2>/dev/null || true
-          ls apps/Android/MnnLlmChat 2>/dev/null || true
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -67,8 +84,6 @@ jobs:
           yes | "$SM" --licenses >/dev/null 2>&1 || true
           [ -n "$REQ" ] && { "$SM" --install "ndk;$REQ" || echo "WARN: NDK $REQ install failed"; }
           "$SM" --install "cmake;3.22.1" || echo "WARN: cmake install failed"
-          ls "$ANDROID_HOME/ndk" 2>/dev/null || true
-          ls "$ANDROID_HOME/cmake" 2>/dev/null || true
           if [ -n "$REQ" ] && [ -d "$ANDROID_HOME/ndk/$REQ" ]; then
             CHOSEN="$ANDROID_HOME/ndk/$REQ"
           else
@@ -80,12 +95,11 @@ jobs:
           echo "ANDROID_NDK=$CHOSEN"      >> "$GITHUB_ENV"
           echo "Selected NDK: $CHOSEN"
 
-      - name: Build MNN native libs
+      - name: Build MNN native libs (with diffusion)
         working-directory: project/android
         run: |
           set -e
           export PATH="$ANDROID_HOME/cmake/3.22.1/bin:$PATH"
-          echo "Which cmake: $(command -v cmake)"
           cmake --version
 
           rm -rf build_64
@@ -102,30 +116,32 @@ jobs:
             -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true \
             -DMNN_BUILD_LLM=true \
             -DMNN_BUILD_EXPRESS=true \
+            -DMNN_BUILD_DIFFUSION=ON \
             -DMNN_SUPPORT_TRANSFORMER_FUSE=true \
             -DMNN_ARM82=true \
             -DMNN_OPENCL=false \
             -DMNN_SEP_BUILD=false
           make -j"$(nproc)"
           make install || true
-          echo "=== .so under build_64/lib ==="
-          ls -la lib/ 2>/dev/null || true
-          echo "=== .so under build_64/install/lib ==="
-          ls -la install/lib/ 2>/dev/null || true
+          echo "=== ALL .so in build_64 ==="
+          find . -name '*.so' -type f | sort || true
+          echo "=== ALL .so in install/lib ==="
+          find install/lib -name '*.so' -type f 2>/dev/null | sort || true
 
-      - name: Verify libMNN.so contains Express symbols
+      - name: Inspect which .so has createDiffusion
         working-directory: project/android/build_64
         run: |
           set -e
           NM="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
-          LIB="lib/libMNN.so"
-          [ ! -f "$LIB" ] && LIB="$(find . -name 'libMNN.so' -type f | head -n1)"
-          [ -z "$LIB" ] && { echo "ERROR: libMNN.so not built"; exit 1; }
-          echo "Inspecting: $LIB"
-          echo "--- Express symbols count ---"
-          "$NM" -D --defined-only "$LIB" 2>/dev/null | grep -c 'MNN::Express' || echo 0
-          echo "--- Sample Express symbols ---"
-          "$NM" -D --defined-only "$LIB" 2>/dev/null | grep 'MNN::Express' | head -n 10 || true
+          echo "=== Scanning all .so for MNN::DIFFUSION / createDiffusion ==="
+          for so in $(find . install -name '*.so' -type f 2>/dev/null | sort -u); do
+            cnt=$("$NM" -D --defined-only "$so" 2>/dev/null | grep -cE 'createDiffusion|MNN::DIFFUSION' || echo 0)
+            printf "%-60s %s\n" "$so" "$cnt"
+            if [ "$cnt" != "0" ]; then
+              echo "  --- sample from $so ---"
+              "$NM" -D --defined-only "$so" 2>/dev/null | grep -E 'createDiffusion|MNN::DIFFUSION' | head -n 5 | sed 's/^/    /'
+            fi
+          done
 
       - name: Normalize lib locations
         working-directory: project/android
@@ -136,22 +152,65 @@ jobs:
           find build_64 -name '*.so' -type f -exec cp -n -v {} build_64/install/lib/ \;
           echo "--- build_64/lib ---"
           ls -la build_64/lib/
-          echo "--- build_64/install/lib ---"
-          ls -la build_64/install/lib/
-          [ -f build_64/lib/libMNN.so ]
+
+      - name: Patch mnnllmapp to link MNN_Diffusion
+        run: |
+          set -e
+          CPP_DIR="apps/Android/MnnLlmChat/app/src/main/cpp"
+          CMAKE="$CPP_DIR/CMakeLists.txt"
+          [ ! -f "$CMAKE" ] && { echo "ERROR: $CMAKE not found"; exit 1; }
+          echo "=== Before: target_link_libraries block ==="
+          grep -nE 'target_link_libraries' "$CMAKE" || true
+
+          python3 - "$CMAKE" <<'PYEOF'
+          import re, sys
+          p = sys.argv[1]
+          s = open(p).read()
+
+          # уже линкуется? выходим
+          if re.search(r'target_link_libraries\s*\(\s*mnnllmapp[^)]*\bMNN_Diffusion\b', s, flags=re.S):
+              print("Already links MNN_Diffusion — nothing to do")
+              sys.exit(0)
+
+          # попытка 1: добавить MNN_Diffusion в существующий target_link_libraries(mnnllmapp ...)
+          pat = re.compile(r'(target_link_libraries\s*\(\s*mnnllmapp\b)([^)]*)(\))', re.S)
+          def repl(m):
+              return m.group(1) + m.group(2).rstrip() + '\n    MNN_Diffusion\n' + m.group(3)
+          s2, n = pat.subn(repl, s, count=1)
+          if n:
+              open(p, 'w').write(s2)
+              print(f"Patched existing target_link_libraries: added MNN_Diffusion")
+              sys.exit(0)
+
+          # попытка 2: дописать новый target_link_libraries в конец
+          s2 = s.rstrip() + '\n\ntarget_link_libraries(mnnllmapp MNN_Diffusion)\n'
+          open(p, 'w').write(s2)
+          print("Appended: target_link_libraries(mnnllmapp MNN_Diffusion)")
+          PYEOF
+
+          echo "=== After ==="
+          grep -nE 'target_link_libraries|MNN_Diffusion' "$CMAKE" || true
 
       - name: Copy MNN .so into jniLibs
         run: |
           set -e
           mkdir -p apps/Android/MnnLlmChat/app/src/main/jniLibs/arm64-v8a
-          find project/android/build_64 -name "*.so" -exec cp -v {} apps/Android/MnnLlmChat/app/src/main/jniLibs/arm64-v8a/ \;
+          find project/android/build_64 -name "*.so" -type f -exec cp -v {} apps/Android/MnnLlmChat/app/src/main/jniLibs/arm64-v8a/ \;
+          echo "--- jniLibs ---"
           ls -la apps/Android/MnnLlmChat/app/src/main/jniLibs/arm64-v8a/ || true
 
       - name: Build APK
         working-directory: apps/Android/MnnLlmChat
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace --no-daemon
+          ./gradlew assembleDebug --stacktrace --no-daemon 2>&1 | tee /tmp/gradle-build.log
+        continue-on-error: true
+
+      - name: Extract undefined symbols on failure
+        if: failure()
+        run: |
+          echo "=== undefined symbols from Gradle log ==="
+          grep -E 'undefined symbol' /tmp/gradle-build.log || echo "(none)"
 
       - name: Upload APK
         if: always()
@@ -160,4 +219,12 @@ jobs:
           name: mnn-chat-debug-apk
           path: |
             apps/Android/MnnLlmChat/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+
+      - name: Upload Gradle build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-log
+          path: /tmp/gradle-build.log
           if-no-files-found: warn
